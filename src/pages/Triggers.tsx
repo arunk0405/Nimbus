@@ -178,184 +178,41 @@ const Triggers = () => {
   const simulate = async () => {
     setSimulating(true);
     const meta = TYPE_DB[simType] || TYPE_DB.rain!;
-    const eventId = `BLR-${Date.now().toString().slice(-6)}`;
 
     try {
-      // Only stack disruptions triggered in the last 2 hours — prevents
-      // old stale "active" events from accumulating and inflating payouts.
-      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-      const { data: existingRows } = await supabase
-        .from("disruptions")
-        .select("type")
-        .eq("zone", simZone)
-        .eq("pincode", simPincode)
-        .eq("status", "active")
-        .gte("triggered_at", twoHoursAgo);
+      // Send the payload to the Python Gateway we just built
+      const payload = {
+        source_api: "Demo Simulation",
+        trigger_type: simType,
+        zone: simZone,
+        pincode: simPincode,
+        reading_value: parseFloat(meta.reading) || 100, 
+        reading_unit: meta.reading.replace(/[0-9.]/g, '') || "raw",
+        threshold_limit: parseFloat(meta.threshold) || 50,
+        is_breached: true
+      };
 
-      const existing = (existingRows || []) as { type: string }[];
-      // Cap stack bonus at 1× the primary base so a single co-event can add
-      // at most +70% — not an uncapped multiplier of N events.
-      const rawStack = existing.reduce(
-        (sum, row) => sum + 0.7 * baseForType(row.type),
-        0
-      );
-      const primaryBase = baseForType(simType);
-      const stackBonus = Math.min(rawStack, primaryBase); // cap at 1× base
-      const payoutAmount = Math.round(primaryBase + stackBonus);
+      const res = await fetch("http://localhost:8000/api/simulate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-      const { data: inserted, error: insErr } = await supabase
-        .from("disruptions")
-        .insert({
-          event_id: eventId,
-          type: simType,
-          zone: simZone,
-          pincode: simPincode,
-          severity: "high" as DisruptionSeverity,
-          reading: meta.reading,
-          threshold: meta.threshold,
-          status: "active",
-          triggered_at: new Date().toISOString(),
-        })
-        .select("id")
-        .single();
-
-      if (insErr) throw insErr;
-      const disruptionId = inserted!.id;
-
-      const { data: workers, error: wErr } = await supabase
-        .from("workers")
-        .select("id, earnings_baseline, upi_id, trust_score")
-        .eq("pincode", simPincode);
-
-      if (wErr) throw wErr;
-
-      const eligible: {
-        id: string;
-        earnings_baseline: number | null;
-        upi_id: string | null;
-        trust_score: number | null;
-        max_payout: number;
-      }[] = [];
-
-      for (const w of workers || []) {
-        const { data: pol } = await supabase
-          .from("policies")
-          .select("max_payout")
-          .eq("worker_id", w.id)
-          .eq("status", "active")
-          .maybeSingle();
-        if (pol) {
-          eligible.push({ ...w, max_payout: Number(pol.max_payout) });
-        }
-      }
-
-      if (eligible.length === 0) {
-        toast.info(
-          "Disruption recorded. No workers with active policies matched this pincode."
-        );
-        setModalOpen(false);
-        await load();
-        return;
-      }
-
-      const sampleCap = Math.min(payoutAmount, eligible[0]!.max_payout);
-      toast.success(
-        `Disruption triggered in ${simZone}. Processing ₹${sampleCap} payout for ${eligible.length} worker${
-          eligible.length === 1 ? "" : "s"
-        }...`
-      );
-
-      for (const w of eligible) {
-        const capped = Math.min(payoutAmount, w.max_payout);
-        const baseline = Number(w.earnings_baseline ?? 1000);
-        const protectionPct = Math.round((capped / baseline) * 100);
-        const explainer = `Event #${eventId}: ${simType} (${meta.reading}) detected in ${simZone}. Your baseline: ₹${baseline}. Protected at ${protectionPct}% = ₹${capped} credited.`;
-
-        const { data: claimRow, error: cErr } = await supabase
-          .from("claims")
-          .insert({
-            worker_id: w.id,
-            disruption_id: disruptionId,
-            payout_amount: capped,
-            baseline_earnings: baseline,
-            protection_percentage: protectionPct,
-            explainer_text: explainer,
-            status: "processing",
-            fraud_flag: false,
-          })
-          .select("id")
-          .single();
-
-        if (cErr || !claimRow) {
-          console.error(cErr);
-          continue;
-        }
-
-        const fraudReq = {
-          trust_score: w.trust_score ?? 100,
-          gps_speed_kmph: 0,
-          gps_jump_km: 0,
-          gps_in_zone: 1,
-          api_confirmed: 1,
-          same_event_claims_count: 1,
-          pincode_changes_30days: 0,
-          weekly_claims: 1,
-          avg_weekly_claims: 0.5,
-          claim_spike_ratio: 1.0,
-          payout_amount: capped,
-          earnings_baseline: baseline,
-          payout_vs_baseline_ratio: capped / baseline,
-          hours_since_last_claim: 168,
-          zone_disruption_confirmed: 1,
-          neighbor_zone_payout: 0,
-        };
-
-        const fraudResult = await fetchMLFraudScore(fraudReq);
-        const shouldFlag = fraudResult ? fraudResult.fraud_score > 60 : false;
-
-        console.log(
-          "ML Fraud Score:",
-          fraudResult?.fraud_score,
-          "Flagged:",
-          shouldFlag,
-          "Flags:",
-          fraudResult?.flags
-        );
-
-        if (shouldFlag) {
-          await supabase
-            .from("claims")
-            .update({ fraud_flag: true })
-            .eq("id", claimRow.id);
-        }
-
-        await sleep(2000);
-        await supabase
-          .from("claims")
-          .update({ status: "approved", approved_at: new Date().toISOString() })
-          .eq("id", claimRow.id);
-
-        await sleep(1000);
-        await supabase.from("payouts").insert({
-          claim_id: claimRow.id,
-          worker_id: w.id,
-          amount: capped,
-          upi_id: w.upi_id || "",
-          status: "completed",
-        });
-        await supabase
-          .from("claims")
-          .update({ status: "paid" })
-          .eq("id", claimRow.id);
-        await supabase
-          .from("workers")
-          .update({ trust_score: (w.trust_score ?? 0) + 1 })
-          .eq("id", w.id);
-
-        toast.success(`₹${capped} credited to ${w.upi_id || "UPI"}`);
+      if (!res.ok) throw new Error("Failed to process simulation via Gateway API");
+      
+      const data = await res.json();
+      
+      if (data.status === "processed" && data.workers_compensated > 0) {
+          toast.success(`Disruption triggered in ${simZone}. Processed payouts for ${data.workers_compensated} worker(s).`);
+      } else if (data.status === "processed") {
+          toast.info(`Disruption recorded in ${simZone}, but no active workers found in pincode ${simPincode}.`);
+      } else {
+          toast.info(`Result: ${data.message || data.status}`);
       }
 
       setModalOpen(false);
+      // Sleep to let Supabase catch up before fetching new data
+      await sleep(1000);
       await load();
     } catch (err: unknown) {
       toast.error(err instanceof Error ? err.message : "Failed to simulate");
